@@ -1,0 +1,10 @@
+# Generated inspection outputs
+*.png
+*.json
+
+# Original data should not be uploaded
+data_1/
+
+result/
+output_stone/
+runs/
