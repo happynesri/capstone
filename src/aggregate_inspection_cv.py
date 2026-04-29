@@ -15,6 +15,83 @@ def nothing(x):
 
 class AggregateInspector:
 
+    def _build_stone_mask(self, frame):
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        L, _, _ = cv2.split(lab)
+
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        L_eq = clahe.apply(L)
+
+        bg_sigma = max(25, int(self.blur_kernel * 7))
+        bg = cv2.GaussianBlur(L_eq, (0, 0), bg_sigma)
+        detail = cv2.subtract(L_eq, bg)
+        detail_norm = cv2.normalize(detail, None, 0, 255, cv2.NORM_MINMAX)
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        inv_sat = 255 - hsv[:, :, 1]
+
+        mix = cv2.addWeighted(detail_norm, 0.8, inv_sat, 0.2, 0)
+        mix = cv2.GaussianBlur(mix, (5, 5), 0)
+
+        _, mask = cv2.threshold(mix, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        close_k = max(21, self.morph_kernel * 4 + 1)
+        if close_k % 2 == 0:
+            close_k += 1
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+
+        return mask
+
+    def _refine_binary_mask(self, binary, min_area, border_margin=0):
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mk = max(3, self.morph_kernel)
+        if mk % 2 == 0:
+            mk += 1
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (mk, mk))
+
+        mask = cv2.medianBlur(binary, 5)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        refined = np.zeros_like(mask)
+        h, w = mask.shape[:2]
+
+        for label_idx in range(1, num_labels):
+            x = stats[label_idx, cv2.CC_STAT_LEFT]
+            y = stats[label_idx, cv2.CC_STAT_TOP]
+            ww = stats[label_idx, cv2.CC_STAT_WIDTH]
+            hh = stats[label_idx, cv2.CC_STAT_HEIGHT]
+            area = stats[label_idx, cv2.CC_STAT_AREA]
+
+            if area < min_area:
+                continue
+
+            if border_margin > 0:
+                if x <= border_margin or y <= border_margin:
+                    continue
+                if (x + ww) >= (w - border_margin) or (y + hh) >= (h - border_margin):
+                    continue
+
+            refined[labels == label_idx] = 255
+
+        return refined
+
+    def _smooth_contour(self, contour):
+        if contour is None or len(contour) < 5:
+            return contour
+
+        peri = cv2.arcLength(contour, True)
+        epsilon = max(2.0, 0.02 * peri)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        if approx is None or len(approx) < 3:
+            return contour
+        return cv2.convexHull(approx)
+
     
     def detect_stone_edges(self, frame):
         original = frame.copy()
@@ -30,43 +107,37 @@ class AggregateInspector:
         else:
             proc = frame.copy()
 
-        gray = cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY)
-
-        bk = max(3, self.blur_kernel)
-        if bk % 2 == 0:
-            bk += 1
-
-        # 경계 보존을 위해 Gaussian 대신 bilateral 사용
-        smooth = cv2.bilateralFilter(gray, 9, 50, 50)
-
-        # canny edge
-        edges = cv2.Canny(smooth, 40, 120)
-
-        mk = max(3, self.morph_kernel)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (mk, mk))
-
-        # 끊긴 edge를 조금 연결
-        edges = cv2.dilate(edges, kernel, iterations=1)
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
+        edges = self._build_stone_mask(proc)
 
         roi_mask = self._build_roi_mask(edges.shape[0], edges.shape[1])
         edges = cv2.bitwise_and(edges, roi_mask)
 
+        edges = self._refine_binary_mask(
+            edges,
+            min_area=max(250, int(self.min_contour_area * 0.3)),
+            border_margin=3,
+        )
+
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         debug_edge = original.copy()
+        clean_edge_map = np.zeros_like(edges)
         scale = self.process_scale if self.process_scale > 0 else 1.0
 
         edge_stones = []
         stone_id = 0
 
+        candidates = []
         for contour in contours:
-            area_proc = cv2.contourArea(contour)
+            contour_smooth = self._smooth_contour(contour)
+            if contour_smooth is None:
+                contour_smooth = contour
 
+            area_proc = cv2.contourArea(contour_smooth)
             if area_proc < self.min_contour_area or area_proc > self.max_contour_area:
                 continue
 
-            rect = cv2.minAreaRect(contour)
+            rect = cv2.minAreaRect(contour_smooth)
             (cx_proc, cy_proc), (w_proc, h_proc), angle = rect
 
             if w_proc < 1 or h_proc < 1:
@@ -76,6 +147,44 @@ class AggregateInspector:
             short_axis_proc = min(w_proc, h_proc)
             aspect_ratio = long_axis_proc / max(short_axis_proc, 1e-6)
 
+            hull = cv2.convexHull(contour_smooth)
+            hull_area = cv2.contourArea(hull)
+            solidity = area_proc / max(hull_area, 1e-6)
+
+            if short_axis_proc < self.edge_short_axis_min:
+                continue
+            if aspect_ratio > self.edge_aspect_ratio_max:
+                continue
+            if solidity < self.edge_min_solidity:
+                continue
+
+            candidates.append((
+                area_proc,
+                contour_smooth,
+                rect,
+                aspect_ratio,
+                angle,
+                cx_proc,
+                cy_proc,
+                long_axis_proc,
+                short_axis_proc,
+            ))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        candidates = candidates[:self.edge_keep_top_k]
+
+        for (
+            area_proc,
+            contour_draw,
+            rect,
+            aspect_ratio,
+            angle,
+            cx_proc,
+            cy_proc,
+            long_axis_proc,
+            short_axis_proc,
+        ) in candidates:
+
             area_px = area_proc / (scale * scale)
             cx = cx_proc / scale
             cy = cy_proc / scale
@@ -84,7 +193,9 @@ class AggregateInspector:
 
             stone_id += 1
 
-            contour_draw = contour.astype(np.float32)
+            cv2.drawContours(clean_edge_map, [contour_draw], -1, 255, 2)
+
+            contour_draw = contour_draw.astype(np.float32)
             contour_draw[:, 0, 0] /= scale
             contour_draw[:, 0, 1] /= scale
             contour_draw = contour_draw.astype(np.int32)
@@ -119,7 +230,7 @@ class AggregateInspector:
             })
 
         return {
-            "edges": edges,
+            "edges": clean_edge_map,
             "debug_edge": debug_edge,
             "edge_stones": edge_stones
         }
@@ -138,6 +249,10 @@ class AggregateInspector:
         binary_thresh=100,
         morph_kernel=5,
         blur_kernel=5,
+        edge_short_axis_min=28,
+        edge_aspect_ratio_max=6.0,
+        edge_min_solidity=0.82,
+        edge_keep_top_k=8,
         process_scale=1.0,
         roi_top=0,
         roi_bottom=0,
@@ -156,6 +271,10 @@ class AggregateInspector:
         self.binary_thresh = binary_thresh
         self.morph_kernel = morph_kernel
         self.blur_kernel = blur_kernel
+        self.edge_short_axis_min = edge_short_axis_min
+        self.edge_aspect_ratio_max = edge_aspect_ratio_max
+        self.edge_min_solidity = edge_min_solidity
+        self.edge_keep_top_k = edge_keep_top_k
         self.process_scale = process_scale
         self.roi_top = roi_top
         self.roi_bottom = roi_bottom
@@ -233,6 +352,12 @@ class AggregateInspector:
         roi_mask = self._build_roi_mask(binary.shape[0], binary.shape[1])
         binary = cv2.bitwise_and(binary, roi_mask)
 
+        binary = self._refine_binary_mask(
+            binary,
+            min_area=max(250, int(self.min_contour_area * 0.3)),
+            border_margin=3,
+        )
+
         contours, _ = cv2.findContours(
             binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -255,6 +380,10 @@ class AggregateInspector:
             if w_proc < 1 or h_proc < 1:
                 continue
 
+            contour_draw = self._smooth_contour(contour)
+            if contour_draw is None:
+                contour_draw = contour
+
             long_axis_proc = max(w_proc, h_proc)
             short_axis_proc = min(w_proc, h_proc)
             aspect_ratio = long_axis_proc / max(short_axis_proc, 1e-6)
@@ -275,7 +404,7 @@ class AggregateInspector:
             stone_id += 1
 
             # contour draw를 위해 원래 스케일로 복원
-            contour_draw = contour.astype(np.float32)
+            contour_draw = contour_draw.astype(np.float32)
             contour_draw[:, 0, 0] /= scale
             contour_draw[:, 0, 1] /= scale
             contour_draw = contour_draw.astype(np.int32)
@@ -382,7 +511,7 @@ def print_stone_info(stones):
         )
 
 
-def save_results(image_path, result, output_dir="../result"):
+def save_results(image_path, result, output_dir="../result", suffix=""):
     """
     이미지 처리 결과를 result 폴더에 저장합니다.
     
@@ -390,29 +519,22 @@ def save_results(image_path, result, output_dir="../result"):
         image_path: 입력 이미지 경로
         result: inspect() 함수의 반환값 dictionary
         output_dir: 결과 저장 폴더 (기본값: ../result)
+        suffix: 출력 파일 이름에 추가할 접미사
     """
-    # 결과 디렉토리 생성
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
-    # 입력 파일명 추출 (확장자 제거)
     image_name = Path(image_path).stem
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # 파일 이름들
-    debug_file = os.path.join(output_dir, f"{image_name}_debug_{timestamp}.png")
-    binary_file = os.path.join(output_dir, f"{image_name}_binary_{timestamp}.png")
-    gray_file = os.path.join(output_dir, f"{image_name}_gray_{timestamp}.png")
-    json_file = os.path.join(output_dir, f"{image_name}_results_{timestamp}.json")
-    
-    # 이미지 저장
+    suffix = f"_{suffix}" if suffix else ""
+    debug_file = os.path.join(output_dir, f"{image_name}_debug{suffix}_{timestamp}.png")
+    binary_file = os.path.join(output_dir, f"{image_name}_binary{suffix}_{timestamp}.png")
+    gray_file = os.path.join(output_dir, f"{image_name}_gray{suffix}_{timestamp}.png")
+    json_file = os.path.join(output_dir, f"{image_name}_results{suffix}_{timestamp}.json")
     cv2.imwrite(debug_file, result["debug"])
     cv2.imwrite(binary_file, result["binary"])
     cv2.imwrite(gray_file, result["gray"])
     print(f"✓ 이미지 저장 완료: {debug_file}")
     print(f"✓ 이미지 저장 완료: {binary_file}")
     print(f"✓ 이미지 저장 완료: {gray_file}")
-    
-    # 결과 JSON 저장
     output_data = {
         "image_path": str(image_path),
         "timestamp": timestamp,
@@ -421,10 +543,133 @@ def save_results(image_path, result, output_dir="../result"):
         "fail_count": sum(1 for s in result["stones"] if not s["pass"]),
         "stones": result["stones"]
     }
-    
     with open(json_file, 'w', encoding='utf-8') as f:
         json.dump(output_data, f, indent=2, ensure_ascii=False)
     print(f"✓ 결과 저장 완료: {json_file}")
+
+
+DEFAULT_INSPECTOR_PRESETS = {
+    "baseline": {
+        "min_contour_area": 1000,
+        "max_contour_area": 1000000,
+        "long_axis_min": 30,
+        "long_axis_max": 300,
+        "short_axis_min": 20,
+        "short_axis_max": 200,
+        "aspect_ratio_max": 4.0,
+        "threshold_mode": 1,
+        "use_otsu": True,
+        "binary_thresh": 100,
+        "morph_kernel": 5,
+        "blur_kernel": 5,
+        "process_scale": 1.0,
+    },
+    "wide": {
+        "min_contour_area": 700,
+        "max_contour_area": 1000000,
+        "long_axis_min": 20,
+        "long_axis_max": 400,
+        "short_axis_min": 12,
+        "short_axis_max": 220,
+        "aspect_ratio_max": 5.5,
+        "threshold_mode": 1,
+        "use_otsu": True,
+        "binary_thresh": 100,
+        "morph_kernel": 3,
+        "blur_kernel": 3,
+        "process_scale": 1.0,
+    },
+    "tight": {
+        "min_contour_area": 1200,
+        "max_contour_area": 1000000,
+        "long_axis_min": 40,
+        "long_axis_max": 300,
+        "short_axis_min": 25,
+        "short_axis_max": 200,
+        "aspect_ratio_max": 3.5,
+        "threshold_mode": 1,
+        "use_otsu": True,
+        "binary_thresh": 100,
+        "morph_kernel": 7,
+        "blur_kernel": 7,
+        "process_scale": 1.0,
+    },
+    "binary_low": {
+        "min_contour_area": 800,
+        "max_contour_area": 1000000,
+        "long_axis_min": 25,
+        "long_axis_max": 350,
+        "short_axis_min": 16,
+        "short_axis_max": 220,
+        "aspect_ratio_max": 5.0,
+        "threshold_mode": 1,
+        "use_otsu": False,
+        "binary_thresh": 90,
+        "morph_kernel": 5,
+        "blur_kernel": 5,
+        "process_scale": 1.0,
+    },
+    "binary_high": {
+        "min_contour_area": 1200,
+        "max_contour_area": 1000000,
+        "long_axis_min": 35,
+        "long_axis_max": 320,
+        "short_axis_min": 20,
+        "short_axis_max": 200,
+        "aspect_ratio_max": 4.5,
+        "threshold_mode": 1,
+        "use_otsu": False,
+        "binary_thresh": 130,
+        "morph_kernel": 7,
+        "blur_kernel": 5,
+        "process_scale": 1.0,
+    },
+}
+
+
+def build_inspector_from_preset(preset_name, roi_top=0, roi_bottom=0, roi_left=0, roi_right=0):
+    config = DEFAULT_INSPECTOR_PRESETS.get(preset_name)
+    if config is None:
+        raise ValueError(f"알 수 없는 preset: {preset_name}")
+    return AggregateInspector(
+        roi_top=roi_top,
+        roi_bottom=roi_bottom,
+        roi_left=roi_left,
+        roi_right=roi_right,
+        **config,
+    )
+
+
+def run_on_image_with_presets(image_path, preset_names, use_gui=False):
+    frame = cv2.imread(image_path)
+    if frame is None:
+        print(f"이미지를 불러올 수 없습니다: {image_path}")
+        return
+
+    for preset_name in preset_names:
+        print(f"\n=== Preset: {preset_name} ===")
+        inspector = build_inspector_from_preset(preset_name)
+        result = inspector.inspect(frame)
+        edge_result = inspector.detect_stone_edges(frame)
+
+        print_stone_info(result["stones"])
+        save_results(image_path, result, output_dir="../result", suffix=preset_name)
+
+        edge_output_dir = "../result"
+        Path(edge_output_dir).mkdir(parents=True, exist_ok=True)
+        image_name = Path(image_path).stem
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        edge_file = os.path.join(edge_output_dir, f"{image_name}_edge_{preset_name}_{timestamp}.png")
+        edge_debug_file = os.path.join(edge_output_dir, f"{image_name}_edge_debug_{preset_name}_{timestamp}.png")
+        cv2.imwrite(edge_file, edge_result["edges"])
+        cv2.imwrite(edge_debug_file, edge_result["debug_edge"])
+        print(f"✓ edge 저장 완료: {edge_file}")
+        print(f"✓ edge debug 저장 완료: {edge_debug_file}")
+
+        if use_gui:
+            cv2.imshow(f"binary_{preset_name}", result["binary"])
+            cv2.imshow(f"debug_{preset_name}", result["debug"])
+            cv2.waitKey(1)
 
 
 def run_on_image(image_path, inspector, use_gui=True):
@@ -536,29 +781,38 @@ def main():
     parser.add_argument("--roi-bottom", type=int, default=0, help="검출 제외 하단 픽셀")
     parser.add_argument("--roi-left", type=int, default=0, help="검출 제외 좌측 픽셀")
     parser.add_argument("--roi-right", type=int, default=0, help="검출 제외 우측 픽셀")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default="baseline",
+        choices=list(DEFAULT_INSPECTOR_PRESETS.keys()) + ["all"],
+        help="사용할 기본 파라미터 preset"
+    )
+    parser.add_argument(
+        "--batch-default",
+        action="store_true",
+        help="모든 기본 preset을 순차 실행하여 결과를 비교"
+    )
     args = parser.parse_args()
 
-    inspector = AggregateInspector(
-        min_contour_area=1000,
-        max_contour_area=1000000,
-        long_axis_min=30,
-        long_axis_max=300,
-        short_axis_min=20,
-        short_axis_max=200,
-        aspect_ratio_max=4.0,
-        threshold_mode=1,
-        use_otsu=True,
-        binary_thresh=100,
-        morph_kernel=5,
-        blur_kernel=5,
-        process_scale=1.0,
+    use_gui = not args.nogui
+
+    if args.batch_default and args.image is None:
+        print("--batch-default는 --image와 함께 사용해야 합니다.")
+        return
+
+    if args.batch_default or args.preset == "all":
+        preset_names = list(DEFAULT_INSPECTOR_PRESETS.keys())
+        run_on_image_with_presets(args.image, preset_names, use_gui=False)
+        return
+
+    inspector = build_inspector_from_preset(
+        args.preset,
         roi_top=args.roi_top,
         roi_bottom=args.roi_bottom,
         roi_left=args.roi_left,
         roi_right=args.roi_right,
     )
-
-    use_gui = not args.nogui
 
     if args.image is not None:
         run_on_image(args.image, inspector, use_gui=use_gui)
@@ -571,6 +825,8 @@ def main():
         print("  python3 aggregate_inspection_cv.py --image /path/to/image.png")
         print("  python3 aggregate_inspection_cv.py --video /path/to/video.mp4")
         print("  python3 aggregate_inspection_cv.py --camera 0")
+        print("  python3 aggregate_inspection_cv.py --image /path/to/image.png --batch-default")
+        print("  python3 aggregate_inspection_cv.py --image /path/to/image.png --preset wide")
 
 
 if __name__ == "__main__":
