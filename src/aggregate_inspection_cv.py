@@ -258,6 +258,11 @@ class AggregateInspector:
         roi_bottom=0,
         roi_left=0,
         roi_right=0,
+        min_delta_l=18.0,
+        min_extent=0.40,
+        min_solidity_filter=0.60,
+        ring_px=20,
+        margin_px=40,
     ):
         self.min_contour_area = min_contour_area
         self.max_contour_area = max_contour_area
@@ -280,6 +285,11 @@ class AggregateInspector:
         self.roi_bottom = roi_bottom
         self.roi_left = roi_left
         self.roi_right = roi_right
+        self.min_delta_l = min_delta_l
+        self.min_extent = min_extent
+        self.min_solidity_filter = min_solidity_filter
+        self.ring_px = ring_px
+        self.margin_px = margin_px
 
     def _build_roi_mask(self, height, width):
         top = max(0, int(self.roi_top))
@@ -363,10 +373,27 @@ class AggregateInspector:
         )
 
         debug = original.copy()
+        debug_rejected = original.copy()
         scale = self.process_scale if self.process_scale > 0 else 1.0
 
+        # LAB 색공간에서 L 채널 추출
+        lab = cv2.cvtColor(proc, cv2.COLOR_BGR2LAB)
+        L_channel = lab[:, :, 1].astype(np.float32)
+
         stones = []
+        rejected_stones = []
         stone_id = 0
+        rejected_id = 0
+
+        # ROI 내부 영역 계산
+        top = max(0, int(self.roi_top))
+        bottom = max(0, int(self.roi_bottom))
+        left = max(0, int(self.roi_left))
+        right = max(0, int(self.roi_right))
+        roi_h = binary.shape[0] - top - bottom
+        roi_w = binary.shape[1] - left - right
+        roi_x1, roi_y1 = left, top
+        roi_x2, roi_y2 = left + roi_w, top + roi_h
 
         for contour in contours:
             area_proc = cv2.contourArea(contour)
@@ -395,6 +422,73 @@ class AggregateInspector:
             long_axis = long_axis_proc / scale
             short_axis = short_axis_proc / scale
 
+            # ===== 후처리 필터 1: ROI 가장자리 제거 =====
+            margin_scaled = self.margin_px / scale
+            if (cx < roi_x1 + margin_scaled or cy < roi_y1 + margin_scaled or
+                cx > roi_x2 - margin_scaled or cy > roi_y2 - margin_scaled):
+                rejected_id += 1
+                rejected_stones.append(({
+                    "id": rejected_id,
+                    "center_x": float(cx),
+                    "center_y": float(cy),
+                    "reason": "margin"
+                }))
+                continue
+
+            # ===== 후처리 필터 2: extent (contour area / minAreaRect area) =====
+            rect_area = w_proc * h_proc
+            extent = area_proc / max(rect_area, 1e-6)
+            if extent < self.min_extent:
+                rejected_id += 1
+                rejected_stones.append({
+                    "id": rejected_id,
+                    "center_x": float(cx),
+                    "center_y": float(cy),
+                    "reason": "extent"
+                })
+                continue
+
+            # ===== 후처리 필터 3: solidity (contour area / convex hull area) =====
+            hull = cv2.convexHull(contour_draw)
+            hull_area = cv2.contourArea(hull)
+            solidity = area_proc / max(hull_area, 1e-6)
+            if solidity < self.min_solidity_filter:
+                rejected_id += 1
+                rejected_stones.append({
+                    "id": rejected_id,
+                    "center_x": float(cx),
+                    "center_y": float(cy),
+                    "reason": "solidity"
+                })
+                continue
+
+            # ===== 후처리 필터 4: 내부 vs ring 밝기 차이 =====
+            # contour 내부 평균 L값 계산
+            mask_contour = np.zeros_like(binary)
+            cv2.drawContours(mask_contour, [contour_draw], -1, 255, -1)
+            mean_inside_L = cv2.mean(L_channel, mask=mask_contour)[0]
+
+            # ring 영역 (contour 외부 ring_px 거리) 평균 L값 계산
+            kernel_dilate_ring = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.ring_px * 2 + 1, self.ring_px * 2 + 1))
+            mask_dilated_ring = cv2.dilate(mask_contour, kernel_dilate_ring, iterations=1)
+            mask_ring = cv2.subtract(mask_dilated_ring, mask_contour)
+            
+            delta_L = 0
+            if cv2.countNonZero(mask_ring) > 0:
+                mean_ring_L = cv2.mean(L_channel, mask=mask_ring)[0]
+                delta_L = mean_inside_L - mean_ring_L
+                # delta_L 검사는 선택사항 (너무 엄격하면 주석 처리)
+                # if delta_L < self.min_delta_l:
+                #     rejected_id += 1
+                #     rejected_stones.append({
+                #         "id": rejected_id,
+                #         "center_x": float(cx),
+                #         "center_y": float(cy),
+                #         "reason": "delta_L"
+                #     })
+                #     continue
+
+            # ===== 기본 조건 검사 =====
             is_pass = (
                 self.long_axis_min <= long_axis <= self.long_axis_max and
                 self.short_axis_min <= short_axis <= self.short_axis_max and
@@ -444,13 +538,27 @@ class AggregateInspector:
                 "aspect_ratio": float(aspect_ratio),
                 "angle_deg": float(angle),
                 "pass": bool(is_pass),
+                "extent": float(extent),
+                "solidity": float(solidity),
+                "delta_L": float(delta_L),
             })
+
+        # 거부된 후보들을 debug_rejected에 빨간색으로 표시
+        for rej in rejected_stones:
+            cv2.circle(debug_rejected, (int(rej["center_x"]), int(rej["center_y"])), 8, (0, 0, 255), 2)
+            cv2.putText(
+                debug_rejected, f"REJ:{rej['reason']}", 
+                (int(rej["center_x"]) - 40, int(rej["center_y"]) - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA
+            )
 
         return {
             "debug": debug,
+            "debug_rejected": debug_rejected,
             "gray": gray,
             "binary": binary,
-            "stones": stones
+            "stones": stones,
+            "rejected": rejected_stones
         }
 
 
@@ -526,22 +634,31 @@ def save_results(image_path, result, output_dir="../result", suffix=""):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = f"_{suffix}" if suffix else ""
     debug_file = os.path.join(output_dir, f"{image_name}_debug{suffix}_{timestamp}.png")
+    debug_rejected_file = os.path.join(output_dir, f"{image_name}_debug_rejected{suffix}_{timestamp}.png")
     binary_file = os.path.join(output_dir, f"{image_name}_binary{suffix}_{timestamp}.png")
     gray_file = os.path.join(output_dir, f"{image_name}_gray{suffix}_{timestamp}.png")
     json_file = os.path.join(output_dir, f"{image_name}_results{suffix}_{timestamp}.json")
+    
     cv2.imwrite(debug_file, result["debug"])
+    if "debug_rejected" in result:
+        cv2.imwrite(debug_rejected_file, result["debug_rejected"])
+        print(f"✓ 이미지 저장 완료: {debug_rejected_file}")
     cv2.imwrite(binary_file, result["binary"])
     cv2.imwrite(gray_file, result["gray"])
     print(f"✓ 이미지 저장 완료: {debug_file}")
     print(f"✓ 이미지 저장 완료: {binary_file}")
     print(f"✓ 이미지 저장 완료: {gray_file}")
+    
     output_data = {
         "image_path": str(image_path),
         "timestamp": timestamp,
         "total_stones": len(result["stones"]),
         "pass_count": sum(1 for s in result["stones"] if s["pass"]),
         "fail_count": sum(1 for s in result["stones"] if not s["pass"]),
-        "stones": result["stones"]
+        "accepted_count": len(result["stones"]),
+        "rejected_count": len(result.get("rejected", [])),
+        "stones": result["stones"],
+        "rejected_candidates": result.get("rejected", [])
     }
     with open(json_file, 'w', encoding='utf-8') as f:
         json.dump(output_data, f, indent=2, ensure_ascii=False)
@@ -549,20 +666,40 @@ def save_results(image_path, result, output_dir="../result", suffix=""):
 
 
 DEFAULT_INSPECTOR_PRESETS = {
-    "baseline": {
-        "min_contour_area": 1000,
+    "aggressive": {
+        "min_contour_area": 180,
         "max_contour_area": 1000000,
-        "long_axis_min": 30,
-        "long_axis_max": 300,
-        "short_axis_min": 20,
-        "short_axis_max": 200,
-        "aspect_ratio_max": 4.0,
+        "long_axis_min": 8,
+        "long_axis_max": 600,
+        "short_axis_min": 4,
+        "short_axis_max": 400,
+        "aspect_ratio_max": 10.0,
         "threshold_mode": 1,
         "use_otsu": True,
         "binary_thresh": 100,
-        "morph_kernel": 5,
-        "blur_kernel": 5,
+        "morph_kernel": 1,
+        "blur_kernel": 1,
         "process_scale": 1.0,
+    },
+    "baseline": {
+        "min_contour_area": 400,
+        "max_contour_area": 20000,
+        "long_axis_min": 20,
+        "long_axis_max": 500,
+        "short_axis_min": 10,
+        "short_axis_max": 300,
+        "aspect_ratio_max": 5.5,
+        "threshold_mode": 1,
+        "use_otsu": True,
+        "binary_thresh": 100,
+        "morph_kernel": 2,
+        "blur_kernel": 3,
+        "process_scale": 1.0,
+        "min_delta_l": 8.0,
+        "min_extent": 0.25,
+        "min_solidity_filter": 0.45,
+        "ring_px": 25,
+        "margin_px": 50,
     },
     "wide": {
         "min_contour_area": 700,
@@ -641,6 +778,7 @@ def build_inspector_from_preset(preset_name, roi_top=0, roi_bottom=0, roi_left=0
 
 
 def run_on_image_with_presets(image_path, preset_names, use_gui=False):
+    image_path = resolve_image_path(image_path)
     frame = cv2.imread(image_path)
     if frame is None:
         print(f"이미지를 불러올 수 없습니다: {image_path}")
@@ -672,7 +810,46 @@ def run_on_image_with_presets(image_path, preset_names, use_gui=False):
             cv2.waitKey(1)
 
 
+def resolve_image_path(image_path):
+    """경로를 여러 방식으로 시도하여 파일을 찾습니다."""
+    import os
+    from pathlib import Path
+    
+    # 1. 입력 경로 그대로 시도
+    if os.path.exists(image_path):
+        return image_path
+    
+    # 2. ~ 확장 경로 시도
+    expanded = os.path.expanduser(image_path)
+    if os.path.exists(expanded):
+        return expanded
+    
+    # 3. 상대 경로 시도 (현재 디렉터리)
+    if os.path.exists(image_path):
+        return image_path
+    
+    # 4. 상대 경로 시도 (부모 디렉터리의 data_1)
+    base_name = os.path.basename(image_path)
+    relative_paths = [
+        os.path.join("../data_1", base_name),
+        os.path.join("../../data_1", base_name),
+        os.path.join("data_1", base_name),
+    ]
+    for path in relative_paths:
+        if os.path.exists(path):
+            return path
+    
+    # 5. /capstone -> /home/sanghwon/capstone 변환 시도
+    if image_path.startswith("/capstone/"):
+        home_path = f"/home/sanghwon{image_path}"
+        if os.path.exists(home_path):
+            return home_path
+    
+    return image_path  # 찾지 못하면 원래 경로 반환
+
+
 def run_on_image(image_path, inspector, use_gui=True):
+    image_path = resolve_image_path(image_path)
     frame = cv2.imread(image_path)
     if frame is None:
         print(f"이미지를 불러올 수 없습니다: {image_path}")
