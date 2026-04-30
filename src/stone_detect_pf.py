@@ -880,21 +880,6 @@ def estimate_px_per_cm_from_zigzag(
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
-    component_filtered = np.zeros_like(binary)
-    min_component_area = max(80, int(binary.size * 0.0004))
-    for label in range(1, num):
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        cw = int(stats[label, cv2.CC_STAT_WIDTH])
-        ch = int(stats[label, cv2.CC_STAT_HEIGHT])
-        if area < min_component_area:
-            continue
-        # 지그재그 선은 작고 둥근 노이즈보다 x/y 방향으로 길게 이어진다.
-        if max(cw, ch) < 18:
-            continue
-        component_filtered[labels == label] = 255
-    binary = component_filtered
-
     _, xs = np.where(binary > 0)
     if len(xs) < 100:
         raise RuntimeError("지그재그 흰색 픽셀을 충분히 찾지 못했습니다. --px-per-cm을 직접 입력하세요.")
@@ -917,41 +902,22 @@ def estimate_px_per_cm_from_zigzag(
         elif projection[p] > projection[filtered[-1]]:
             filtered[-1] = p
 
-    if len(filtered) < 10:
+    if len(filtered) < 5:
         raise RuntimeError("지그재그 peak를 충분히 찾지 못했습니다. --px-per-cm을 직접 입력하세요.")
 
     distances = np.diff(filtered)
-    q1, q3 = np.percentile(distances, [25, 75])
-    iqr = q3 - q1
-    if iqr <= 1e-6:
-        valid_mask = np.ones_like(distances, dtype=bool)
-    else:
-        valid_mask = (distances > q1 - 1.5 * iqr) & (distances < q3 + 1.5 * iqr)
-    valid = distances[valid_mask]
-    used_peak_indices: set[int] = set()
-    for idx, is_valid in enumerate(valid_mask):
-        if is_valid:
-            used_peak_indices.add(idx)
-            used_peak_indices.add(idx + 1)
-    used_peaks = [filtered[idx] for idx in sorted(used_peak_indices)]
+    med = np.median(distances)
+    valid = distances[(distances > med * 0.6) & (distances < med * 1.4)]
 
-    if len(used_peaks) < 10 or len(valid) < 9:
+    if len(valid) < 4:
         raise RuntimeError("지그재그 간격 추정이 불안정합니다. --px-per-cm을 직접 입력하세요.")
 
     px_per_cm = float(np.median(valid))
-    if px_per_cm < 40.0 or px_per_cm > 120.0:
-        raise RuntimeError("auto scale unreliable, use --px-per-cm")
 
     if debug_dir is not None:
         debug_img = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-        raw_peak_set = set(peaks)
-        filtered_peak_set = set(filtered)
-        used_peak_set = set(used_peaks)
-        for p in sorted(raw_peak_set - filtered_peak_set):
-            cv2.line(debug_img, (p, 0), (p, debug_img.shape[0] - 1), (0, 0, 255), 1)
         for p in filtered:
-            color = (0, 255, 0) if p in used_peak_set else (0, 165, 255)
-            cv2.line(debug_img, (p, 0), (p, debug_img.shape[0] - 1), color, 1)
+            cv2.line(debug_img, (p, 0), (p, debug_img.shape[0] - 1), (0, 0, 255), 1)
         cv2.imwrite(str(Path(debug_dir) / f"{stem}_debug_zigzag_scale.png"), debug_img)
 
     return px_per_cm
