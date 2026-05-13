@@ -1,11 +1,42 @@
-# Generated inspection outputs
-*.png
-*.json
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 
-# Original data should not be uploaded
-data_1/
+# Virtual environments and local config
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Source data and generated datasets
+/data_1/
+/raw_data/
 /datasets/
 
-result/
+# Generated inspection/training outputs
+/result/
+/runs/
+/src/result/
 output_stone/
-runs/
+
+# Model weights and exported artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.weights
+
+# Large/generated arrays and reports
+*.npy
+*.npz
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
