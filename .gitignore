@@ -4,6 +4,7 @@
 
 # Original data should not be uploaded
 data_1/
+/datasets/
 
 result/
 output_stone/
