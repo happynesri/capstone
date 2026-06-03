@@ -1,0 +1,22 @@
+YOLOv8-seg inference speed benchmark
+Model: best.pt
+Images: 500
+Measured samples: 500
+Input size: 640
+Device: 0
+Mean latency: 38.68 ms/image
+Median latency: 31.40 ms/image
+P95 latency: 58.94 ms/image
+Mean FPS: 31.27 FPS
+Median FPS: 31.85 FPS
+Mean model inference time: 5.08 ms/image
+Average detected instances: 5.00
+
+Mask R-CNN baseline reference:
+Mask R-CNN evaluation reference latency: 47.95 ms/image
+YOLO mean latency = 38.68 ms/image
+Mask R-CNN latency = 47.95 ms/image
+Speedup = 47.95 / 38.68 = 1.24x faster
+
+Conclusion:
+The YOLOv8-seg model satisfies near real-time / real-time inference requirements for the aggregate inspection pipeline.

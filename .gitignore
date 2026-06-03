@@ -18,19 +18,14 @@ env/
 /data_1/
 /raw_data/
 /datasets/
+/maskrcnn_pipeline/dataset/*.json
 
 # Generated inspection/training outputs
 output_stone/
-
-# Skip all images under result/ (recursive)
-/result/**/*.png
-/result/**/*.jpg
-/result/**/*.jpeg
-/result/**/*.bmp
-/result/**/*.webp
-
-# Skip root-level result json snapshots
-/result/*.json
+/runs/
+/result/
+/src/result/
+/final_result.zip
 
 # Model weights and exported artifacts
 *.pt

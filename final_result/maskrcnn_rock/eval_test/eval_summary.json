@@ -1,0 +1,17 @@
+{
+  "box_precision_best": 0.9957373738288879,
+  "box_recall_best": 0.997904360294342,
+  "box_f1_best": 0.9968196749687195,
+  "box_best_conf": 0.99,
+  "box_ap50": 0.9949062478256785,
+  "mask_precision_best": 0.9953620433807373,
+  "mask_recall_best": 0.9975281953811646,
+  "mask_f1_best": 0.9964439272880554,
+  "mask_best_conf": 0.99,
+  "mask_ap50": 0.9942769460524303,
+  "num_images": 7385,
+  "num_gt_instances": 37220,
+  "num_pred_instances": 37394,
+  "inference_ms_per_image": 47.94741556468281,
+  "total_evaluation_time_s": 1814.1003649870036
+}
