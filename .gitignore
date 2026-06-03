@@ -20,10 +20,17 @@ env/
 /datasets/
 
 # Generated inspection/training outputs
-/result/
-/runs/
-/src/result/
 output_stone/
+
+# Skip all images under result/ (recursive)
+/result/**/*.png
+/result/**/*.jpg
+/result/**/*.jpeg
+/result/**/*.bmp
+/result/**/*.webp
+
+# Skip root-level result json snapshots
+/result/*.json
 
 # Model weights and exported artifacts
 *.pt
@@ -32,6 +39,15 @@ output_stone/
 *.onnx
 *.engine
 *.weights
+
+# ROS2 workspace build outputs
+/ros2_ws/
+/ros2_ws/build/
+/ros2_ws/install/
+/ros2_ws/log/
+
+# Local Copilot/editor metadata
+/.codex
 
 # Large/generated arrays and reports
 *.npy
